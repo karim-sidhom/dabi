@@ -748,7 +748,7 @@ function renderEmergencyNumbers(cc) {
 }
 
 // ══ CORE ══
-const GPS_ACC=150, GPS_AGE=30000, GPS_DIST=0.05, GPS_OPT={enableHighAccuracy:true,timeout:20000,maximumAge:0};
+const GPS_ACC=150, GPS_FALLBACK_ACC=2500, GPS_AGE=30000, GPS_DIST=0.05, GPS_INITIAL_FALLBACK_MS=8000, GPS_OPT={enableHighAccuracy:true,timeout:20000,maximumAge:0};
 const RADII=[0.5,1,2,5,10,20];
 
 function haversineKm(a,b,c,e){const R=6371,dL=d2r(c-a),dO=d2r(e-b),x=Math.sin(dL/2)**2+Math.cos(d2r(a))*Math.cos(d2r(c))*Math.sin(dO/2)**2;return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));}
@@ -877,7 +877,8 @@ function initApp(lat,lng){
     findNearbyATMs(lat,lng);
 }
 
-function isGoodGps(p){if(!p||!p.coords)return false;const acc=p.coords.accuracy;if(!Number.isFinite(acc)||acc>GPS_ACC)return false;const age=Number.isFinite(p.timestamp)?Math.max(0,Date.now()-p.timestamp):Infinity;return age<=GPS_AGE;}
+function gpsQuality(pos){const valid=pos&&pos.coords&&Number.isFinite(pos.coords.accuracy);const acc=valid?pos.coords.accuracy:Infinity;const age=Number.isFinite(pos&&pos.timestamp)?Math.max(0,Date.now()-pos.timestamp):Infinity;return{usable:valid&&age<=GPS_AGE&&acc<=GPS_FALLBACK_ACC,accurate:valid&&age<=GPS_AGE&&acc<=GPS_ACC,acc};}
+function betterGps(a,b){if(!a)return b;return gpsQuality(b).acc<gpsQuality(a).acc?b:a;}
 
 function applyGps(pos,notify=true){const{latitude:nl,longitude:no,accuracy:acc}=pos.coords;const at=Number.isFinite(acc)?`${Math.round(acc)} م`:'?';const has=Number.isFinite(currentLat)&&Number.isFinite(currentLng);const dist=has?haversineKm(currentLat,currentLng,nl,no):Infinity;if(!has||dist>GPS_DIST){initApp(nl,no);if(has&&notify)showNotif(`📍 موقع جديد: ${nl.toFixed(4)}، ${no.toFixed(4)} · دقة ${at}`,true);return true;}return false;}
 
@@ -890,10 +891,30 @@ function startGPS(){
     document.getElementById('zone-title').textContent='الصرّافات الآليّة القريبة';
     if(!navigator.geolocation){document.getElementById('gps-txt').textContent='⚠️ GPS غير مدعوم في هذا المتصفح.';atmState('⚠️ متصفحك لا يدعم تحديد الموقع الجغرافي.');return;}
     let init=false;
-    gpsWatchId=navigator.geolocation.watchPosition(pos=>{
-        if(!isGoodGps(pos)){const acc=pos.coords?Math.round(pos.coords.accuracy):'?';document.getElementById('gps-txt').textContent=`📡 انتظار إشارة GPS... (دقة: ${acc} م)`;if(!init)atmState('إشارة GPS ضعيفة، يرجى الانتظار...');return;}
-        applyGps(pos,init);init=true;
-    },err=>{const msgs={1:'⚠️ رُفض إذن GPS. يرجى السماح بالموقع في المتصفح.',2:'⚠️ GPS غير متاح أو الإشارة ضعيفة.',3:'⚠️ انتهت مهلة GPS. حاول مجدداً.'};const msg=(err&&msgs[err.code])||'⚠️ خطأ GPS غير معروف.';document.getElementById('gps-txt').textContent=msg;atmState(msg);if(err&&err.code===1&&gpsWatchId!==null){navigator.geolocation.clearWatch(gpsWatchId);gpsWatchId=null;}},GPS_OPT);
+    let pendingPos=null;
+    let fallbackTimer=null;
+    const clearFallback=()=>{if(fallbackTimer){clearTimeout(fallbackTimer);fallbackTimer=null;}};
+    const useInitial=pos=>{clearFallback();applyGps(pos,false);init=true;};
+    try{
+        gpsWatchId=navigator.geolocation.watchPosition(pos=>{
+            const q=gpsQuality(pos);
+            const acc=Number.isFinite(q.acc)?Math.round(q.acc):'?';
+            if(!q.usable){document.getElementById('gps-txt').textContent=`📡 انتظار إشارة GPS... (دقة: ${acc} م)`;if(!init)atmState('إشارة GPS ضعيفة، يرجى الانتظار...');return;}
+            if(!init){
+                pendingPos=betterGps(pendingPos,pos);
+                if(q.accurate){useInitial(pos);return;}
+                document.getElementById('gps-txt').textContent=`📡 تم التقاط موقع تقريبي... (دقة: ${acc} م)`;
+                atmState('تم التقاط موقع تقريبي، نحاول تحسين الدقة...');
+                if(!fallbackTimer){fallbackTimer=setTimeout(()=>{fallbackTimer=null;if(!init&&pendingPos){useInitial(pendingPos);showNotif('تم استخدام موقع تقريبي. للإحكام أكثر أدخل الإحداثيات يدوياً.',false);}},GPS_INITIAL_FALLBACK_MS);}
+                return;
+            }
+            if(!q.accurate){document.getElementById('gps-txt').textContent=`📡 GPS تقريبي، ننتظر دقة أفضل... (${acc} م)`;return;}
+            applyGps(pos,true);
+        },err=>{clearFallback();const msgs={1:'⚠️ رُفض إذن GPS. يرجى السماح بالموقع في المتصفح.',2:'⚠️ GPS غير متاح أو الإشارة ضعيفة.',3:'⚠️ انتهت مهلة GPS. حاول مجدداً.'};const msg=(err&&msgs[err.code])||'⚠️ خطأ GPS غير معروف.';document.getElementById('gps-txt').textContent=msg;atmState(msg);if(err&&err.code===1&&gpsWatchId!==null){navigator.geolocation.clearWatch(gpsWatchId);gpsWatchId=null;}},GPS_OPT);
+    }catch(e){
+        document.getElementById('gps-txt').textContent='⚠️ GPS غير مدعوم في هذا المتصفح.';
+        atmState('⚠️ متصفحك لا يدعم تحديد الموقع الجغرافي.');
+    }
 }
 
 // ══ PRAYER TIMES ══
